@@ -21,6 +21,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
+# Parche de seguridad: el digest fija la base, pero zlib1g tenía CVE con corrección
+# Hallazgo de Trivy al hacer el CI. Se actualiza solo ese paquete.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --only-upgrade zlib1g \
+ && rm -rf /var/lib/apt/lists/*
+
 # Usuario sin privilegios, con UID numérico fijo y sin shell de login
 RUN groupadd --system --gid 10001 app \
  && useradd  --system --uid 10001 --gid app --no-create-home \

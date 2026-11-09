@@ -64,7 +64,7 @@ jobs:
       - name: Instalar Semgrep
         run: pip install semgrep==1.182.1
 
-      - name: Semgrep (rompe el build con severidad ERROR)
+      - name: Semgrep (Detiene el build con severidad ERROR)
         run: >
           semgrep scan --config p/python --config p/owasp-top-ten
           --metrics=off --severity ERROR --error app
@@ -90,7 +90,7 @@ jobs:
       - name: Instalar pip-audit
         run: pip install pip-audit==2.10.1
 
-      # Cualquier vulnerabilidad conocida rompe el build. Una excepción se hace con
+      # Cualquier vulnerabilidad conocida detiene el build. Una excepción se hace con
       # --ignore-vuln <ID> y debe llevar aquí un comentario con su justificación.
       - name: Auditar dependencias
         run: pip-audit -r requirements.txt --strict
@@ -113,7 +113,6 @@ jobs:
         run: pip install checkov==3.3.30
 
       # Analiza el Dockerfile, los workflows de GitHub Actions y, cuando exista, Terraform.
-      # Un check fallido rompe el build; un skip va en línea, con su justificación.
       - name: Escanear configuración
         run: >
           checkov -d . --framework dockerfile,github_actions,terraform
@@ -122,10 +121,7 @@ jobs:
   # Imagen
   image:
     name: Imagen (build, pruebas y Trivy)
-    # TODO: volver a incluir `sca` cuando se resuelva el hallazgo de starlette.
-    # Mientras tanto `sca` sigue en rojo (y debe seguir siendo un check requerido
-    # para fusionar), pero no impide verificar la imagen.
-    needs: [secrets-scan, sast, iac]
+    needs: [secrets-scan, sast, sca, iac]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -177,7 +173,7 @@ jobs:
           echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy
 
-      - name: Trivy (rompe con CRITICAL/HIGH que tengan corrección)
+      - name: Trivy (Se detiene con CRITICAL/HIGH que tengan corrección)
         run: >
           "$RUNNER_TEMP/trivy" image --severity CRITICAL,HIGH --ignore-unfixed
           --exit-code 1 --no-progress banxico-api:ci
