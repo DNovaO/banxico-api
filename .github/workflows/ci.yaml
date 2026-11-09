@@ -1,0 +1,188 @@
+name: CI
+
+# Controles de seguridad que NO necesitan AWS. El despliegue irá en un workflow
+# aparte (deploy.yml), cuando exista el rol OIDC creado con Terraform.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Permisos mínimos para todo el workflow: solo lectura del repositorio. 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Herramientas instaladas desde su release con el hash SHA-256 fijado.
+  # Si el binario cambia, la verificación falla y el job se detiene como medida de seguridad.
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.76.1"
+  TRIVY_SHA256: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+
+jobs:
+  # Secretos
+  secrets-scan:
+    name: Secretos (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # historial completo: un secreto borrado sigue en el historial
+          persist-credentials: false
+
+      - name: Instalar Gitleaks (versión y hash fijados)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+
+      # --redact: el repositorio es público y los logs también; nunca imprimir el valor.
+      - name: Escanear el repositorio y su historial
+        run: '"$RUNNER_TEMP/gitleaks" detect --source . --redact --exit-code 1 --verbose'
+
+  # SAST
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar Semgrep
+        run: pip install semgrep==1.182.1
+
+      - name: Semgrep (rompe el build con severidad ERROR)
+        run: >
+          semgrep scan --config p/python --config p/owasp-top-ten
+          --metrics=off --severity ERROR --error app
+
+      - name: Semgrep (severidad menor, solo aviso)
+        run: >
+          semgrep scan --config p/python --config p/owasp-top-ten
+          --metrics=off --severity WARNING --severity INFO app
+
+  sca:
+    name: Dependencias (pip-audit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar pip-audit
+        run: pip install pip-audit==2.10.1
+
+      # Cualquier vulnerabilidad conocida rompe el build. Una excepción se hace con
+      # --ignore-vuln <ID> y debe llevar aquí un comentario con su justificación.
+      - name: Auditar dependencias
+        run: pip-audit -r requirements.txt --strict
+
+  # IaC
+  iac:
+    name: Configuración (Checkov)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar Checkov
+        run: pip install checkov==3.3.30
+
+      # Analiza el Dockerfile, los workflows de GitHub Actions y, cuando exista, Terraform.
+      # Un check fallido rompe el build; un skip va en línea, con su justificación.
+      - name: Escanear configuración
+        run: >
+          checkov -d . --framework dockerfile,github_actions,terraform
+          --skip-download --compact --quiet
+
+  # Imagen
+  image:
+    name: Imagen (build, pruebas y Trivy)
+    # TODO: volver a incluir `sca` cuando se resuelva el hallazgo de starlette.
+    # Mientras tanto `sca` sigue en rojo (y debe seguir siendo un check requerido
+    # para fusionar), pero no impide verificar la imagen.
+    needs: [secrets-scan, sast, iac]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 
+        with:
+          persist-credentials: false
+
+      - name: Construir la imagen
+        run: docker build -t banxico-api:ci .
+
+      - name: Comprobar que no corre como root
+        run: |
+          uid="$(docker run --rm banxico-api:ci id -u)"
+          echo "uid del proceso: $uid"
+          test "$uid" = "10001"
+
+      - name: Arranque y health check (token ficticio)
+        run: |
+          fake="$(head -c 64 /dev/zero | tr '\0' 'a')"
+          docker run -d --name api -p 8000:8000 -e BANXICO_TOKEN="$fake" banxico-api:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/healthz; then echo; exit 0; fi
+            sleep 1
+          done
+          docker logs api
+          exit 1
+
+      - name: Limpiar el contenedor
+        if: always()
+        run: docker rm -f api || true
+
+      # Automatiza la falla de que el token aparece en el log: un token inválido no debe aparecer en el log.
+      - name: El token inválido no se filtra al arrancar
+        run: |
+          fake="tokenfalso123"
+          out="$(docker run --rm -e BANXICO_TOKEN="$fake" banxico-api:ci 2>&1 || true)"
+          tail -n 5 <<< "$out"
+          if ! grep -q "string_too_short" <<< "$out"; then
+            echo "::error::No se produjo el error de validación esperado"; exit 1
+          fi
+          if grep -q "$fake" <<< "$out"; then
+            echo "::error::El valor del token aparece en el error de arranque"; exit 1
+          fi
+
+      - name: Instalar Trivy (versión y hash fijados)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/trivy.tgz" -C "$RUNNER_TEMP" trivy
+
+      - name: Trivy (rompe con CRITICAL/HIGH que tengan corrección)
+        run: >
+          "$RUNNER_TEMP/trivy" image --severity CRITICAL,HIGH --ignore-unfixed
+          --exit-code 1 --no-progress banxico-api:ci
+
+      - name: Trivy (resto de hallazgos, solo aviso)
+        run: >
+          "$RUNNER_TEMP/trivy" image --severity MEDIUM,LOW
+          --no-progress banxico-api:ci
