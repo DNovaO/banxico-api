@@ -1,0 +1,29 @@
+# Secretos: nunca deben entrar al contexto de build
+.env
+.env.*
+*.pem
+*.key
+
+# Control de versiones y CI
+.git
+.gitignore
+.github
+
+# Código que no se ejecuta en runtime
+tests
+requirements-dev.txt
+README.md
+
+# Infraestructura (vive en el repo, no en la imagen)
+terraform
+*.tf
+*.tfstate*
+.terraform
+
+# Basura de Python y entornos locales
+__pycache__
+*.pyc
+.venv
+venv
+.pytest_cache
+.mypy_cache
